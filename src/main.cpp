@@ -135,7 +135,7 @@ int main(int argc, char *argv[]) {
 
 	// Shader module
 	std::vector<char> ShaderContents;
-	if (std::ifstream ShaderFile{ "shaders/shader.comp.spv", std::ios::binary | std::ios::ate }) {
+	if (std::ifstream ShaderFile{ "shaders/shader.hlsl.spv", std::ios::binary | std::ios::ate }) {
 		const size_t FileSize = ShaderFile.tellg();
 		ShaderFile.seekg(0);
 		ShaderContents.resize(FileSize, '\0');
