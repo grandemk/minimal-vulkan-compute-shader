@@ -75,6 +75,7 @@ int main(int argc, char *argv[]) {
 	
 	// Create buffers
 	const uint32_t NumElements = 10;
+	const uint32_t Count = NumElements;
 	const uint32_t BufferSize = NumElements * sizeof(int32_t);
 
 	vk::BufferCreateInfo BufferCreateInfo{
@@ -88,9 +89,20 @@ int main(int argc, char *argv[]) {
 	vk::Buffer InBuffer = Device.createBuffer(BufferCreateInfo);
 	vk::Buffer OutBuffer = Device.createBuffer(BufferCreateInfo);
 
+	vk::BufferCreateInfo ParamsBufferCreateInfo{
+		vk::BufferCreateFlags(),                    // Flags
+		sizeof(uint32_t),                           // Size
+		vk::BufferUsageFlagBits::eUniformBuffer,    // Usage
+		vk::SharingMode::eExclusive,                // Sharing mode
+		1,                                          // Number of queue family indices
+		&ComputeQueueFamilyIndex                    // List of queue family indices
+	};
+	vk::Buffer ParamsBuffer = Device.createBuffer(ParamsBufferCreateInfo);
+
 	// Memory req
 	vk::MemoryRequirements InBufferMemoryRequirements = Device.getBufferMemoryRequirements(InBuffer);
 	vk::MemoryRequirements OutBufferMemoryRequirements = Device.getBufferMemoryRequirements(OutBuffer);
+	vk::MemoryRequirements ParamsBufferMemoryRequirements = Device.getBufferMemoryRequirements(ParamsBuffer);
 
 	// query
 	vk::PhysicalDeviceMemoryProperties MemoryProperties = PhysicalDevice.getMemoryProperties();
@@ -115,19 +127,26 @@ int main(int argc, char *argv[]) {
 	// Allocate memory
 	vk::MemoryAllocateInfo InBufferMemoryAllocateInfo(InBufferMemoryRequirements.size, MemoryTypeIndex);
 	vk::MemoryAllocateInfo OutBufferMemoryAllocateInfo(OutBufferMemoryRequirements.size, MemoryTypeIndex);
+	vk::MemoryAllocateInfo ParamsBufferMemoryAllocateInfo(ParamsBufferMemoryRequirements.size, MemoryTypeIndex);
 	vk::DeviceMemory InBufferMemory = Device.allocateMemory(InBufferMemoryAllocateInfo);
-	vk::DeviceMemory OutBufferMemory = Device.allocateMemory(InBufferMemoryAllocateInfo);
+	vk::DeviceMemory OutBufferMemory = Device.allocateMemory(OutBufferMemoryAllocateInfo);
+	vk::DeviceMemory ParamsBufferMemory = Device.allocateMemory(ParamsBufferMemoryAllocateInfo);
 
 	// Map memory and write
 	int32_t* InBufferPtr = static_cast<int32_t*>(Device.mapMemory(InBufferMemory, 0, BufferSize));
 	for (uint32_t I = 0; I < NumElements; ++I) {
-		InBufferPtr[I] = I;
+		InBufferPtr[I] = NumElements - I;
 	}
 	Device.unmapMemory(InBufferMemory);
+
+	uint32_t* ParamsBufferPtr = static_cast<uint32_t*>(Device.mapMemory(ParamsBufferMemory, 0, sizeof(uint32_t)));
+	*ParamsBufferPtr = Count;
+	Device.unmapMemory(ParamsBufferMemory);
 
 	// Bind buffers to memory
 	Device.bindBufferMemory(InBuffer, InBufferMemory, 0);
 	Device.bindBufferMemory(OutBuffer, OutBufferMemory, 0);
+	Device.bindBufferMemory(ParamsBuffer, ParamsBufferMemory, 0);
 
 ////////////////////////////////////////////////////////////////////////
 //                              PIPELINE                              //
@@ -149,10 +168,11 @@ int main(int argc, char *argv[]) {
     vk::ShaderModule ShaderModule = Device.createShaderModule(ShaderModuleCreateInfo);
 
 	// Descriptor Set Layout
-	// The layout of data to be passed to pipelin
+	// The layout of data to be passed to pipeline
 	const std::vector<vk::DescriptorSetLayoutBinding> DescriptorSetLayoutBinding = {
 		{0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
-		{1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute}
+		{1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+		{2, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eCompute}
 	};
 	vk::DescriptorSetLayoutCreateInfo DescriptorSetLayoutCreateInfo(
 		vk::DescriptorSetLayoutCreateFlags(),
@@ -182,8 +202,11 @@ int main(int argc, char *argv[]) {
 //                          DESCRIPTOR SETS                           //
 ////////////////////////////////////////////////////////////////////////
 	// Descriptor sets must be allocated in a vk::DescriptorPool, so we need to create one first
-	vk::DescriptorPoolSize DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 2);
-	vk::DescriptorPoolCreateInfo DescriptorPoolCreateInfo(vk::DescriptorPoolCreateFlags(), 1, DescriptorPoolSize);
+	const std::vector<vk::DescriptorPoolSize> DescriptorPoolSizes = {
+		vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 2),
+		vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 1)
+	};
+	vk::DescriptorPoolCreateInfo DescriptorPoolCreateInfo(vk::DescriptorPoolCreateFlags(), 1, DescriptorPoolSizes);
 	vk::DescriptorPool DescriptorPool = Device.createDescriptorPool(DescriptorPoolCreateInfo);
 
 	// Allocate descriptor sets, update them to use buffers:
@@ -192,10 +215,12 @@ int main(int argc, char *argv[]) {
 	vk::DescriptorSet DescriptorSet = DescriptorSets.front();
 	vk::DescriptorBufferInfo InBufferInfo(InBuffer, 0, NumElements * sizeof(int32_t));
 	vk::DescriptorBufferInfo OutBufferInfo(OutBuffer, 0, NumElements * sizeof(int32_t));
+	vk::DescriptorBufferInfo ParamsBufferInfo(ParamsBuffer, 0, sizeof(uint32_t));
 
 	const std::vector<vk::WriteDescriptorSet> WriteDescriptorSets = {
 		{DescriptorSet, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &InBufferInfo},
 		{DescriptorSet, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &OutBufferInfo},
+		{DescriptorSet, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &ParamsBufferInfo}
 	};
 	Device.updateDescriptorSets(WriteDescriptorSets, {});
 
@@ -273,8 +298,10 @@ int main(int argc, char *argv[]) {
 	Device.destroyCommandPool(CommandPool);
 	Device.freeMemory(InBufferMemory);
 	Device.freeMemory(OutBufferMemory);
+	Device.freeMemory(ParamsBufferMemory);
 	Device.destroyBuffer(InBuffer);
 	Device.destroyBuffer(OutBuffer);
+	Device.destroyBuffer(ParamsBuffer);
 	Device.destroy();
 	Instance.destroy();
     return 0;
