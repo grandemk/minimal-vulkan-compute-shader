@@ -91,6 +91,7 @@ void main(uint3 localId: SV_GroupThreadID, uint3 gtid: SV_DispatchThreadID)
             KeysB[dst] = key;
         }
 
+        // After this, KeysB is commited for all threads
         GroupMemoryBarrierWithGroupSync();
 
         // Swap for next pass
