@@ -4,6 +4,7 @@
 #include <functional>
 #include <vector>
 #include <stack>
+#include <cstring>
 
 #include "Profiler.h"
 #include "ProfilerDll.h"
@@ -61,6 +62,9 @@ struct TContext
 using DestroyFunc = std::function<void()>;
 std::stack<DestroyFunc> g_DestroyStack;
 
+// Global flag to control Vulkan validation layers
+bool g_EnableValidation = true;
+
 
 //////////////////////////////////////////////////////////////////////////
 //                          SUBROUTINES                                 //
@@ -78,7 +82,20 @@ void CreateInstance(TContext& Ctx)
         VK_API_VERSION_1_1    // Vulkan API version
     };
 
-    const std::vector<const char*> Layers = { "VK_LAYER_KHRONOS_validation" };
+    std::vector<const char*> Layers;
+    if (g_EnableValidation) {
+        // Check if validation layer is available
+        std::vector<vk::LayerProperties> AvailableLayers = vk::enumerateInstanceLayerProperties();
+        auto It = std::find_if(AvailableLayers.begin(), AvailableLayers.end(), [](const vk::LayerProperties& Prop) {
+            return strcmp(Prop.layerName, "VK_LAYER_KHRONOS_validation") == 0;
+        });
+        if (It != AvailableLayers.end()) {
+            Layers.push_back("VK_LAYER_KHRONOS_validation");
+        } else {
+            std::cout << "Warning: VK_LAYER_KHRONOS_validation not available, running without validation" << std::endl;
+        }
+    }
+
     vk::InstanceCreateInfo InstanceCreateInfo(
             vk::InstanceCreateFlags(), // Flags
             &AppInfo,                  // Application Info
@@ -459,6 +476,13 @@ void Cleanup(TContext& Ctx)
 //////////////////////////////////////////////////////////////////////////
 
 int main(int argc, char *argv[]) {
+
+    // Parse command-line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--no-validation" || std::string(argv[i]) == "-n") {
+            g_EnableValidation = false;
+        }
+    }
 
     // ── Profiler startup (manual lifetime required by TRACY_MANUAL_LIFETIME) ──
     ProfilerStartup();
