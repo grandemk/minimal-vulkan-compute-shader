@@ -68,7 +68,7 @@ std::stack<DestroyFunc> g_DestroyStack;
 
 void CreateInstance(TContext& Ctx)
 {
-    ZoneScopedN("CreateInstance");
+    ZoneScoped;
 
     vk::ApplicationInfo AppInfo{
         "VulkanCompute",      // Application Name
@@ -94,7 +94,7 @@ void CreateInstance(TContext& Ctx)
 
 void SelectPhysicalDevice(TContext& Ctx)
 {
-    ZoneScopedN("SelectPhysicalDevice");
+    ZoneScoped;
 
     Ctx.PhysicalDevice = Ctx.Instance.enumeratePhysicalDevices().front();
     vk::PhysicalDeviceProperties DeviceProps = Ctx.PhysicalDevice.getProperties();
@@ -106,7 +106,7 @@ void SelectPhysicalDevice(TContext& Ctx)
 
 void FindQueueFamily(TContext& Ctx)
 {
-    ZoneScopedN("FindQueueFamily");
+    ZoneScoped;
 
     std::vector<vk::QueueFamilyProperties> QueueFamilyProps = Ctx.PhysicalDevice.getQueueFamilyProperties();
     auto PropIt = std::find_if(QueueFamilyProps.begin(), QueueFamilyProps.end(), [](const vk::QueueFamilyProperties& Prop) {
@@ -118,7 +118,7 @@ void FindQueueFamily(TContext& Ctx)
 
 void CreateDevice(TContext& Ctx)
 {
-    ZoneScopedN("CreateDevice");
+    ZoneScoped;
 
     float queuePriorities = 1.0f;
     vk::DeviceQueueCreateInfo DeviceQueueCreateInfo(
@@ -142,7 +142,7 @@ void CreateDevice(TContext& Ctx)
 
 void CreateTracyVulkanContext(TContext& Ctx)
 {
-    ZoneScopedN("CreateTracyVulkanContext");
+    ZoneScoped;
 
     // Create a dedicated command pool and buffer for Tracy's internal use.
     // Tracy's background thread will use this for periodic timestamp collection.
@@ -195,7 +195,7 @@ void CreateTracyVulkanContext(TContext& Ctx)
 
 void CreateBuffers(TContext& Ctx)
 {
-    ZoneScopedN("CreateBuffers");
+    ZoneScoped;
 
     const uint32_t NumElements = Ctx.NumElements;
     const uint32_t Count = NumElements;
@@ -284,7 +284,7 @@ void CreateBuffers(TContext& Ctx)
 
 void CreatePipeline(TContext& Ctx)
 {
-    ZoneScopedN("CreatePipeline");
+    ZoneScoped;
 
     // Shader module
     std::vector<char> ShaderContents;
@@ -342,7 +342,7 @@ void CreatePipeline(TContext& Ctx)
 
 void CreateDescriptorSets(TContext& Ctx)
 {
-    ZoneScopedN("CreateDescriptorSets");
+    ZoneScoped;
 
     const std::vector<vk::DescriptorPoolSize> DescriptorPoolSizes = {
         vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 2),
@@ -373,7 +373,7 @@ void CreateDescriptorSets(TContext& Ctx)
 
 void SubmitWork(TContext& Ctx)
 {
-    ZoneScopedN("SubmitWork");
+    ZoneScoped;
 
     // Command Pool
     vk::CommandPoolCreateInfo CommandPoolCreateInfo(vk::CommandPoolCreateFlags(), Ctx.ComputeQueueFamilyIndex);
@@ -449,7 +449,7 @@ void SubmitWork(TContext& Ctx)
 
 void Cleanup(TContext& Ctx)
 {
-    ZoneScopedN("Cleanup");
+    ZoneScoped;
 
     // Execute destroy lambdas in reverse order (LIFO)
     while (!g_DestroyStack.empty()) {
