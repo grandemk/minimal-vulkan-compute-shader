@@ -50,6 +50,7 @@ struct TContext
 
     // Tracy Vulkan context
     vk::CommandPool TracyCommandPool;
+    vk::CommandBuffer TracyCmdBuffer;
     ProfilerVkCtx ProfilerCtx = nullptr;
 
     // Buffer size info
@@ -155,7 +156,7 @@ void CreateTracyVulkanContext(TContext& Ctx)
     vk::CommandBufferAllocateInfo TracyCmdBufInfo(
         Ctx.TracyCommandPool, vk::CommandBufferLevel::ePrimary, 1);
     auto TracyCmdBufs = Ctx.Device.allocateCommandBuffers(TracyCmdBufInfo);
-    vk::CommandBuffer TracyCmdBuffer = TracyCmdBufs.front();
+    Ctx.TracyCmdBuffer = TracyCmdBufs.front();
 
     // Create Tracy Vulkan context.
     // Tracy will use the command buffer for initialization (reset query pool, write timestamps, etc.)
@@ -164,7 +165,7 @@ void CreateTracyVulkanContext(TContext& Ctx)
         static_cast<VkPhysicalDevice>(Ctx.PhysicalDevice),
         static_cast<VkDevice>(Ctx.Device),
         static_cast<VkQueue>(Ctx.Queue),
-        static_cast<VkCommandBuffer>(TracyCmdBuffer));
+        static_cast<VkCommandBuffer>(Ctx.TracyCmdBuffer));
 
     ProfilerVkContextName(Ctx.ProfilerCtx, "Compute", 7);
 
@@ -405,6 +406,16 @@ void SubmitWork(TContext& Ctx)
             { Ctx.Fence },    // List of fences
             true,             // Wait All
             uint64_t(-1));    // Timeout
+
+    // Collect GPU timestamps from Tracy's query pool
+    // This reads the timestamps and sends them to the profiler
+    vk::CommandBufferBeginInfo CollectBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+    Ctx.TracyCmdBuffer.begin(CollectBeginInfo);
+    ProfilerVkCollect(Ctx.ProfilerCtx, static_cast<VkCommandBuffer>(Ctx.TracyCmdBuffer));
+    Ctx.TracyCmdBuffer.end();
+    vk::SubmitInfo CollectSubmitInfo(0, nullptr, nullptr, 1, &Ctx.TracyCmdBuffer);
+    Ctx.Queue.submit({ CollectSubmitInfo });
+    Ctx.Queue.waitIdle();
 
     // Map output buffer and read results
     int32_t* InBufferPtr = static_cast<int32_t*>(Ctx.Device.mapMemory(Ctx.InBufferMemory, 0, Ctx.BufferSize));
