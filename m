@@ -15,7 +15,7 @@ fi
 # Run cmake
 echo "Running cmake..."
 cd "$BUILD_DIR"
-cmake ..
+cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
 
 # Build with make
 echo "Building project..."
