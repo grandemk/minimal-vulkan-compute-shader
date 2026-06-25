@@ -50,7 +50,6 @@ struct TContext
 
     // Tracy Vulkan context
     vk::CommandPool TracyCommandPool;
-    vk::CommandBuffer TracyCmdBuffer;
     ProfilerVkCtx ProfilerCtx = nullptr;
 
     // Buffer size info
@@ -144,8 +143,10 @@ void CreateTracyVulkanContext(TContext& Ctx)
 {
     ZoneScoped;
 
-    // Create a dedicated command pool and buffer for Tracy's internal use.
-    // Tracy's background thread will use this for periodic timestamp collection.
+    // Create a dedicated command pool and buffer for Tracy's initialization.
+    // Tracy needs a command buffer to initialize its query pool and do calibration.
+    // After initialization, Tracy won't touch this command buffer again
+    // (unless TracyVkCollect is called, which we don't use).
     vk::CommandPoolCreateInfo TracyCmdPoolInfo(
         vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
         Ctx.ComputeQueueFamilyIndex);
@@ -153,38 +154,21 @@ void CreateTracyVulkanContext(TContext& Ctx)
 
     vk::CommandBufferAllocateInfo TracyCmdBufInfo(
         Ctx.TracyCommandPool, vk::CommandBufferLevel::ePrimary, 1);
-    std::vector<vk::CommandBuffer> TracyCmdBufs =
-        Ctx.Device.allocateCommandBuffers(TracyCmdBufInfo);
-    Ctx.TracyCmdBuffer = TracyCmdBufs.front();
+    auto TracyCmdBufs = Ctx.Device.allocateCommandBuffers(TracyCmdBufInfo);
+    vk::CommandBuffer TracyCmdBuffer = TracyCmdBufs.front();
 
-    // Begin recording on Tracy command buffer for context creation
-    vk::CommandBufferBeginInfo TracyBeginInfo{};
-    Ctx.TracyCmdBuffer.begin(TracyBeginInfo);
-
-    // Create Tracy Vulkan context with the command buffer in recording state
+    // Create Tracy Vulkan context.
+    // Tracy will use the command buffer for initialization (reset query pool, write timestamps, etc.)
+    // and then return it to the initial state (it calls vkQueueWaitIdle at the end).
     Ctx.ProfilerCtx = ProfilerVkContext(
         static_cast<VkPhysicalDevice>(Ctx.PhysicalDevice),
         static_cast<VkDevice>(Ctx.Device),
         static_cast<VkQueue>(Ctx.Queue),
-        static_cast<VkCommandBuffer>(Ctx.TracyCmdBuffer));
+        static_cast<VkCommandBuffer>(TracyCmdBuffer));
 
     ProfilerVkContextName(Ctx.ProfilerCtx, "Compute", 7);
 
-    // End recording and submit the Tracy command buffer
-    Ctx.TracyCmdBuffer.end();
-    vk::SubmitInfo TracySubmitInfo(0, nullptr, nullptr, 1, &Ctx.TracyCmdBuffer);
-    vk::Fence TracyFence = Ctx.Device.createFence(vk::FenceCreateInfo());
-    Ctx.Queue.submit({ TracySubmitInfo }, TracyFence);
-    (void) Ctx.Device.waitForFences({ TracyFence }, true, uint64_t(-1));
-    Ctx.Device.destroyFence(TracyFence);
-
-    // Wait for queue to be idle
-    Ctx.Queue.waitIdle();
-
     g_DestroyStack.push([&Ctx]() {
-        // Wait for GPU to be idle before destroying Tracy resources
-        Ctx.Device.waitIdle();
-        
         if (Ctx.ProfilerCtx) {
             ProfilerVkDestroy(Ctx.ProfilerCtx);
             Ctx.ProfilerCtx = nullptr;
