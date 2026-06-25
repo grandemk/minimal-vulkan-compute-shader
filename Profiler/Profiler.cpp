@@ -1,6 +1,11 @@
+// Must come before Profiler.h when TRACY_ENABLE is on so that
+// TracyVulkan.hpp (included inside the TRACY_ENABLE block) sees Vulkan types.
+#include <vulkan/vulkan.hpp>
+
 #include "Profiler.h"
 
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdlib>
@@ -10,6 +15,13 @@
 
 namespace
 {
+/// Global flag that tracks whether the profiler is in a state where Tracy
+/// instrumentation is safe to call.  We default to *disabled* so that any
+/// operator new/delete calls that happen *before* StartupProfiler or *after*
+/// ShutdownProfiler (e.g. during static destruction) silently fall back to
+/// plain malloc/free without touching Tracy at all.
+static std::atomic<bool> g_tracyActive{false};
+
 constexpr size_t kMaxDomainDepth = 16;
 
 struct AllocationHeader
@@ -67,8 +79,15 @@ void* AllocateImpl(std::size_t count, size_t alignment)
     auto* ptr = base + prefixSize;
     *(size_t*)(ptr - sizeof(size_t)) = prefixSize;
 
-    ProfilerTraceAllocN(ptr, count, GetMemoryDomainName(header->domain));
-    ProfilerTraceAlloc(ptr, count);
+    // Only call into Tracy when the profiler is known to be alive.
+    // Both the global flag and IsProfilerStarted() must pass so that we are
+    // safe during static init / destruction where the Tracy runtime may
+    // already have been torn down.
+    if (g_tracyActive.load(std::memory_order_relaxed))
+    {
+        ProfilerTraceAllocN(ptr, count, GetMemoryDomainName(header->domain));
+        ProfilerTraceAlloc(ptr, count);
+    }
 
     return ptr;
 }
@@ -81,12 +100,22 @@ void FreeImpl(void* ptr)
         size_t offset = *(size_t*)(data - sizeof(size_t));
         auto* base = data - offset;
         auto* header = (AllocationHeader*)base;
-        ProfilerTraceFreeN(ptr, GetMemoryDomainName(header->domain));
-        ProfilerTraceFree(ptr);
+
+        if (g_tracyActive.load(std::memory_order_relaxed))
+        {
+            ProfilerTraceFreeN(ptr, GetMemoryDomainName(header->domain));
+            ProfilerTraceFree(ptr);
+        }
+
         free(base);
     }
 }
 } // namespace
+
+void SetTracyActive(bool active)
+{
+    g_tracyActive.store(active, std::memory_order_relaxed);
+}
 
 void PushMemoryDomain(MemoryDomain id)
 {

@@ -2,40 +2,55 @@
 #include <iostream>
 #include <fstream>
 
+#include "Profiler.h"
+#include "ProfilerDll.h"
+
 
 int main(int argc, char *argv[]) {
 
-////////////////////////////////////////////////////////////////////////
+    // ── Profiler startup (manual lifetime required by TRACY_MANUAL_LIFETIME) ──
+    ProfilerStartup();
+    SetTracyActive(true);
+    ProfilerAppInfo("MinimalVulkanCompute", 21);
+    ZoneScoped;                         // CPU zone for the whole main()
+
+    // Create a dedicated command buffer for Tracy's Vulkan context
+    // (Tracy re-records and submits this internally for GPU timestamp queries)
+    vk::Device TracyDevice = nullptr;
+    vk::Queue  TracyQueue  = nullptr;
+    vk::CommandBuffer TracyCmdBuffer;
+    vk::CommandPool   TracyCommandPool;
+    ProfilerVkCtx ProfilerCtx = nullptr;
+
+//////////////////////////////////////////////////////////////////////////
 //                          VULKAN INSTANCE                           //
-////////////////////////////////////////////////////////////////////////
-	vk::ApplicationInfo AppInfo{
-		"VulkanCompute",      // Application Name
-		1,                    // Application Version
-		nullptr,              // Engine Name or nullptr
-		0,                    // Engine Version
-		VK_API_VERSION_1_1    // Vulkan API version
-	};
+//////////////////////////////////////////////////////////////////////////
+    vk::ApplicationInfo AppInfo{
+        "VulkanCompute",      // Application Name
+        1,                    // Application Version
+        nullptr,              // Engine Name or nullptr
+        0,                    // Engine Version
+        VK_API_VERSION_1_1    // Vulkan API version
+    };
 
-	const std::vector<const char*> Layers = { "VK_LAYER_KHRONOS_validation" };
-	vk::InstanceCreateInfo InstanceCreateInfo(
-			vk::InstanceCreateFlags(), // Flags
-			&AppInfo,                  // Application Info
-			Layers.size(),             // Layers count
-			Layers.data()              // Layers
-			);
-	vk::Instance Instance = vk::createInstance(InstanceCreateInfo);
+    const std::vector<const char*> Layers = { "VK_LAYER_KHRONOS_validation" };
+    vk::InstanceCreateInfo InstanceCreateInfo(
+            vk::InstanceCreateFlags(), // Flags
+            &AppInfo,                  // Application Info
+            Layers.size(),             // Layers count
+            Layers.data()              // Layers
+            );
+    vk::Instance Instance = vk::createInstance(InstanceCreateInfo);
 
 
-////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////
 //                          PHYSICAL DEVICE                           //
-////////////////////////////////////////////////////////////////////////
-	vk::PhysicalDevice PhysicalDevice = Instance.enumeratePhysicalDevices().front();
-	vk::PhysicalDeviceProperties DeviceProps = PhysicalDevice.getProperties();
-	std::cout << "Device Name    : " << DeviceProps.deviceName << std::endl;
-	const uint32_t ApiVersion = DeviceProps.apiVersion;
-	std::cout << "Vulkan Version : " << VK_VERSION_MAJOR(ApiVersion) << "." << VK_VERSION_MINOR(ApiVersion) << "." << VK_VERSION_PATCH(ApiVersion) << std::endl;
-	// vk::PhysicalDeviceLimits DeviceLimits = DeviceProps.limits;
-	// std::cout << "Max Compute Shared Memory Size: " << DeviceLimits.maxComputeSharedMemorySize / 1024 << " KB" << std::endl;
+//////////////////////////////////////////////////////////////////////////
+    vk::PhysicalDevice PhysicalDevice = Instance.enumeratePhysicalDevices().front();
+    vk::PhysicalDeviceProperties DeviceProps = PhysicalDevice.getProperties();
+    std::cout << "Device Name    : " << DeviceProps.deviceName << std::endl;
+    const uint32_t ApiVersion = DeviceProps.apiVersion;
+    std::cout << "Vulkan Version : " << VK_VERSION_MAJOR(ApiVersion) << "." << VK_VERSION_MINOR(ApiVersion) << "." << VK_VERSION_PATCH(ApiVersion) << std::endl;
 
 
 ////////////////////////////////////////////////////////////////////////
@@ -65,6 +80,34 @@ int main(int argc, char *argv[]) {
 			&DeviceQueueCreateInfo      // Device Queue Create Info struct
 			);
 	vk::Device Device = PhysicalDevice.createDevice(DeviceCreateInfo);
+
+    // Save references for Tracy Vk context and create a dedicated command buffer
+    // for Tracy's internal GPU timestamp queries
+    TracyDevice = Device;
+    TracyQueue  = Device.getQueue(ComputeQueueFamilyIndex, 0);
+
+    {
+        vk::CommandPoolCreateInfo TracyCmdPoolInfo(
+            vk::CommandPoolCreateFlagBits::eTransient |
+            vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            ComputeQueueFamilyIndex);
+        TracyCommandPool = Device.createCommandPool(TracyCmdPoolInfo);
+
+        vk::CommandBufferAllocateInfo TracyCmdBufInfo(
+            TracyCommandPool, vk::CommandBufferLevel::ePrimary, 1);
+        std::vector<vk::CommandBuffer> TracyCmdBufs =
+            Device.allocateCommandBuffers(TracyCmdBufInfo);
+        TracyCmdBuffer = TracyCmdBufs.front();
+    }
+
+    // Create Tracy Vulkan context (raw handles required by TracyVkContext)
+    ProfilerCtx = ProfilerVkContext(
+        static_cast<VkPhysicalDevice>(PhysicalDevice),
+        static_cast<VkDevice>(Device),
+        static_cast<VkQueue>(TracyQueue),
+        static_cast<VkCommandBuffer>(TracyCmdBuffer));
+
+    ProfilerVkContextName(ProfilerCtx, "Compute", 7);
 
 ////////////////////////////////////////////////////////////////////////
 //                         Allocating Memory                          //
@@ -242,6 +285,10 @@ int main(int argc, char *argv[]) {
 	// Record commands
 	vk::CommandBufferBeginInfo CmdBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
 	CmdBuffer.begin(CmdBufferBeginInfo);
+
+    // GPU zone: capture the compute dispatch on the GPU timeline
+    ProfilerVkZone(ProfilerCtx, static_cast<VkCommandBuffer>(CmdBuffer), "ComputeDispatch");
+
 	CmdBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, ComputePipeline);
 	CmdBuffer.bindDescriptorSets(
 			vk::PipelineBindPoint::eCompute,    // Bind point
@@ -251,6 +298,10 @@ int main(int argc, char *argv[]) {
 			{});                             // Dynamic offsets
 	CmdBuffer.dispatch(NumElements, 1, 1);
 	CmdBuffer.end();
+
+    // Collect GPU timestamps from Tracy after recording
+    ProfilerVkCollect(ProfilerCtx, static_cast<VkCommandBuffer>(CmdBuffer));
+    ProfilerVkCollect(ProfilerCtx, static_cast<VkCommandBuffer>(TracyCmdBuffer));
 
 	// Fence and submit
 	vk::Queue Queue = Device.getQueue(ComputeQueueFamilyIndex, 0);
@@ -284,6 +335,9 @@ int main(int argc, char *argv[]) {
 	}
 	std::cout << std::endl;
 	Device.unmapMemory(OutBufferMemory);
+
+    FrameMark;
+
 ////////////////////////////////////////////////////////////////////////
 //                              CLEANUP                               //
 ////////////////////////////////////////////////////////////////////////
@@ -302,7 +356,22 @@ int main(int argc, char *argv[]) {
 	Device.destroyBuffer(InBuffer);
 	Device.destroyBuffer(OutBuffer);
 	Device.destroyBuffer(ParamsBuffer);
+
+    // Teardown order is critical:
+    //   1. Destroy Tracy Vk context (stops GPU queries)
+    //   2. Destroy the Tracy-dedicated command pool
+    //   3. Destroy device + instance
+    //   4. Shutdown the Tracy profiler (stops the worker thread, finalizes rpmalloc)
+    //   5. _exit() instead of return to skip C++ static destructors that would
+    //      otherwise hit Tracy's finalised rpmalloc state.
+    if (ProfilerCtx) {
+        ProfilerVkDestroy(ProfilerCtx);
+    }
+    Device.destroyCommandPool(TracyCommandPool);
+
 	Device.destroy();
 	Instance.destroy();
-    return 0;
+
+    ProfilerShutdown();
+    _exit(0);
 }

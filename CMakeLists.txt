@@ -13,6 +13,16 @@ set(CMAKE_CXX_FLAGS "-Wall -g")
 # Find Vulkan
 find_package(Vulkan)
 
+# Find Tracy (optional) - check local tracy directory first
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tracy/CMakeLists.txt")
+	add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/tracy" tracy_build)
+	set(Tracy_FOUND TRUE)
+	message(STATUS "Tracy profiler found in local directory and will be enabled")
+	add_compile_definitions(TRACY_ENABLE TRACY_VK_CONTEXT TRACY_MANUAL_LIFETIME TRACY_DELAYED_INIT)
+else()
+	set(Tracy_FOUND FALSE)
+	message(STATUS "Tracy profiler not found in local tracy directory")
+endif()
 
 #######################################################################
 #                               SHADERS                               #
@@ -64,6 +74,8 @@ endforeach()
 
 add_custom_target(compile-shaders ALL DEPENDS ${SPV_SHADERS})
 
+# Add Profiler subdirectory
+add_subdirectory(Profiler)
 
 #######################################################################
 #                           MAIN EXECUTABLE                           #
@@ -76,11 +88,15 @@ add_executable(main src/main.cpp)
 target_include_directories(main PUBLIC
 	"${PROJECT_BINARY_DIR}"
 	"${PROJECT_SOURCE_DIR}/src"
+	"${PROJECT_SOURCE_DIR}/include"
+	"${PROJECT_SOURCE_DIR}/Profiler"
 	${Vulkan_INCLUDE_DIRS}
 	)
 
 target_link_libraries(main PUBLIC
 	${Vulkan_LIBRARIES}
+	Profiler
+	$<$<BOOL:${Tracy_FOUND}>:tracy>
 	)
 
 # Make sure shaders are compiled before the main target

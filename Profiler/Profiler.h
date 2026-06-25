@@ -14,6 +14,9 @@ enum class MemoryDomain : i8
 };
 
 #ifdef TRACY_ENABLE
+// TracyVulkan.hpp requires Vulkan headers when TRACY_ENABLE is on.
+// The user must #include <vulkan/vulkan.hpp> before Profiler.h.
+#include "tracy/TracyVulkan.hpp"
 #include "common/TracySystem.hpp" // profiler thread name
 #include "tracy/Tracy.hpp" // CPU profiling
 
@@ -48,9 +51,34 @@ namespace profiler = tracy;
     TracyFreeN(ptr, name)
 #define ZoneScopedTransientN(name) ZoneTransientN(__profiler_hephaistos_zone, name, true)
 
+// ── GPU (Vulkan) zone scopes ────────────────────────────────────────────────
+// Context lifecycle
+using ProfilerVkCtx = TracyVkCtx;
+#define ProfilerVkContext(physdev, device, queue, cmdbuf)          TracyVkContext(physdev, device, queue, cmdbuf)
+#define ProfilerVkContextCalibrated(physdev, device, queue,        \
+                                    cmdbuf, getcalibrated,         \
+                                    gettime)                       TracyVkContextCalibrated(physdev, device, queue, cmdbuf, getcalibrated, gettime)
+#define ProfilerVkDestroy(ctx)                                     TracyVkDestroy(ctx)
+#define ProfilerVkContextName(ctx, name, size)                     TracyVkContextName(ctx, name, size)
+
+// Named / anonymous GPU zones
+#define ProfilerVkNamedZone(ctx, varname, cmdbuf, name, active)    TracyVkNamedZone(ctx, varname, cmdbuf, name, active)
+#define ProfilerVkNamedZoneC(ctx, varname, cmdbuf, name,           \
+                             color, active)                        TracyVkNamedZoneC(ctx, varname, cmdbuf, name, color, active)
+#define ProfilerVkZone(ctx, cmdbuf, name)                          TracyVkZone(ctx, cmdbuf, name)
+#define ProfilerVkZoneC(ctx, cmdbuf, name, color)                  TracyVkZoneC(ctx, cmdbuf, name, color)
+#define ProfilerVkZoneTransient(ctx, varname, cmdbuf, name,        \
+                                active)                             TracyVkZoneTransient(ctx, varname, cmdbuf, name, active)
+
+// Collect GPU timing data
+#define ProfilerVkCollect(ctx, cmdbuf)                             TracyVkCollect(ctx, cmdbuf)
+#define ProfilerVkCollectHost(ctx)                                 TracyVkCollectHost(ctx)
+// ── end GPU zone scopes ─────────────────────────────────────────────────────
+
 void PushMemoryDomain(MemoryDomain id);
 void PopMemoryDomain();
 MemoryDomain GetCurrentMemoryDomain();
+void SetTracyActive(bool active);
 
 #define PROFILER_ENABLE 1
 
@@ -63,6 +91,8 @@ inline MemoryDomain GetCurrentMemoryDomain()
 {
     return MemoryDomain::Default;
 }
+
+inline void SetTracyActive(bool) {}
 
 #define FrameMark
 #define ZoneScopedTransientN(name)
@@ -84,6 +114,23 @@ inline MemoryDomain GetCurrentMemoryDomain()
 #define ProfilerStartup()
 #define ProfilerShutdown()
 #define ProfilerPlot(name, value)
+
+// ── GPU (Vulkan) zone scopes (no-ops) ───────────────────────────────────────
+using ProfilerVkCtx = void*;
+#define ProfilerVkContext(physdev, device, queue, cmdbuf)          nullptr
+#define ProfilerVkContextCalibrated(physdev, device, queue,        \
+                                    cmdbuf, getcalibrated,         \
+                                    gettime)                       nullptr
+#define ProfilerVkDestroy(ctx)
+#define ProfilerVkContextName(ctx, name, size)
+#define ProfilerVkNamedZone(ctx, varname, cmdbuf, name, active)
+#define ProfilerVkNamedZoneC(ctx, varname, cmdbuf, name, color, active)
+#define ProfilerVkZone(ctx, cmdbuf, name)
+#define ProfilerVkZoneC(ctx, cmdbuf, name, color)
+#define ProfilerVkZoneTransient(ctx, varname, cmdbuf, name, active)
+#define ProfilerVkCollect(ctx, cmdbuf)
+#define ProfilerVkCollectHost(ctx)
+// ── end GPU zone scopes (no-ops) ─────────────────────────────────────────────
 
 namespace profiler
 {
