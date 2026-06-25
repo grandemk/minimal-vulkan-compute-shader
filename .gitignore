@@ -1,3 +1,4 @@
 bin
 .clangd
 build
+*.spv
