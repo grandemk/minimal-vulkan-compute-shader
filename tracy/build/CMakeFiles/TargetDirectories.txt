@@ -1,0 +1,3 @@
+/home/keving/repo/minimal-vulkan-compute-shader/tracy/build/CMakeFiles/tracy.dir
+/home/keving/repo/minimal-vulkan-compute-shader/tracy/build/CMakeFiles/edit_cache.dir
+/home/keving/repo/minimal-vulkan-compute-shader/tracy/build/CMakeFiles/rebuild_cache.dir
