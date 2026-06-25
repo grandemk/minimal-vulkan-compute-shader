@@ -1,30 +1,75 @@
 #include <vulkan/vulkan.hpp>
 #include <iostream>
 #include <fstream>
+#include <functional>
+#include <vector>
+#include <stack>
 
 #include "Profiler.h"
 #include "ProfilerDll.h"
 
 
-int main(int argc, char *argv[]) {
+//////////////////////////////////////////////////////////////////////////
+//                              CONTEXT                                 //
+//////////////////////////////////////////////////////////////////////////
 
-    // ── Profiler startup (manual lifetime required by TRACY_MANUAL_LIFETIME) ──
-    ProfilerStartup();
-    SetTracyActive(true);
-    ProfilerAppInfo("MinimalVulkanCompute", 21);
-    ZoneScoped;                         // CPU zone for the whole main()
+struct TContext
+{
+    // Instance & Device
+    vk::Instance Instance;
+    vk::PhysicalDevice PhysicalDevice;
+    vk::Device Device;
+    uint32_t ComputeQueueFamilyIndex = uint32_t(-1);
+    vk::Queue Queue;
 
-    // Create a dedicated command buffer for Tracy's Vulkan context
-    // (Tracy re-records and submits this internally for GPU timestamp queries)
-    vk::Device TracyDevice = nullptr;
-    vk::Queue  TracyQueue  = nullptr;
+    // Buffers & Memory
+    vk::Buffer InBuffer;
+    vk::Buffer OutBuffer;
+    vk::Buffer ParamsBuffer;
+    vk::DeviceMemory InBufferMemory;
+    vk::DeviceMemory OutBufferMemory;
+    vk::DeviceMemory ParamsBufferMemory;
+
+    // Pipeline
+    vk::ShaderModule ShaderModule;
+    vk::DescriptorSetLayout DescriptorSetLayout;
+    vk::PipelineLayout PipelineLayout;
+    vk::PipelineCache PipelineCache;
+    vk::Pipeline ComputePipeline;
+
+    // Descriptor Sets
+    vk::DescriptorPool DescriptorPool;
+    vk::DescriptorSet DescriptorSet;
+
+    // Command Buffer
+    vk::CommandPool CommandPool;
+    vk::CommandBuffer CmdBuffer;
+
+    // Synchronization
+    vk::Fence Fence;
+
+    // Tracy Vulkan context
+    vk::CommandPool TracyCommandPool;
     vk::CommandBuffer TracyCmdBuffer;
-    vk::CommandPool   TracyCommandPool;
     ProfilerVkCtx ProfilerCtx = nullptr;
 
+    // Buffer size info
+    uint32_t NumElements = 10;
+    uint32_t BufferSize = 0;
+};
+
+using DestroyFunc = std::function<void()>;
+std::stack<DestroyFunc> g_DestroyStack;
+
+
 //////////////////////////////////////////////////////////////////////////
-//                          VULKAN INSTANCE                           //
+//                          SUBROUTINES                                 //
 //////////////////////////////////////////////////////////////////////////
+
+void CreateInstance(TContext& Ctx)
+{
+    ZoneScopedN("CreateInstance");
+
     vk::ApplicationInfo AppInfo{
         "VulkanCompute",      // Application Name
         1,                    // Application Version
@@ -40,337 +85,407 @@ int main(int argc, char *argv[]) {
             Layers.size(),             // Layers count
             Layers.data()              // Layers
             );
-    vk::Instance Instance = vk::createInstance(InstanceCreateInfo);
+    Ctx.Instance = vk::createInstance(InstanceCreateInfo);
 
+    g_DestroyStack.push([&Ctx]() {
+        Ctx.Instance.destroy();
+    });
+}
 
-//////////////////////////////////////////////////////////////////////////
-//                          PHYSICAL DEVICE                           //
-//////////////////////////////////////////////////////////////////////////
-    vk::PhysicalDevice PhysicalDevice = Instance.enumeratePhysicalDevices().front();
-    vk::PhysicalDeviceProperties DeviceProps = PhysicalDevice.getProperties();
+void SelectPhysicalDevice(TContext& Ctx)
+{
+    ZoneScopedN("SelectPhysicalDevice");
+
+    Ctx.PhysicalDevice = Ctx.Instance.enumeratePhysicalDevices().front();
+    vk::PhysicalDeviceProperties DeviceProps = Ctx.PhysicalDevice.getProperties();
     std::cout << "Device Name    : " << DeviceProps.deviceName << std::endl;
     const uint32_t ApiVersion = DeviceProps.apiVersion;
-    std::cout << "Vulkan Version : " << VK_VERSION_MAJOR(ApiVersion) << "." << VK_VERSION_MINOR(ApiVersion) << "." << VK_VERSION_PATCH(ApiVersion) << std::endl;
+    std::cout << "Vulkan Version : " << VK_VERSION_MAJOR(ApiVersion) << "." 
+              << VK_VERSION_MINOR(ApiVersion) << "." << VK_VERSION_PATCH(ApiVersion) << std::endl;
+}
 
+void FindQueueFamily(TContext& Ctx)
+{
+    ZoneScopedN("FindQueueFamily");
 
-////////////////////////////////////////////////////////////////////////
-//                            QUEUE FAMILY                            //
-////////////////////////////////////////////////////////////////////////
-	std::vector<vk::QueueFamilyProperties> QueueFamilyProps = PhysicalDevice.getQueueFamilyProperties();
-	auto PropIt = std::find_if(QueueFamilyProps.begin(), QueueFamilyProps.end(), [](const vk::QueueFamilyProperties& Prop) {
-		return Prop.queueFlags & vk::QueueFlagBits::eCompute;
-	});
-	const uint32_t ComputeQueueFamilyIndex = std::distance(QueueFamilyProps.begin(), PropIt);
-	std::cout << "Compute Queue Family Index: " << ComputeQueueFamilyIndex << std::endl;
+    std::vector<vk::QueueFamilyProperties> QueueFamilyProps = Ctx.PhysicalDevice.getQueueFamilyProperties();
+    auto PropIt = std::find_if(QueueFamilyProps.begin(), QueueFamilyProps.end(), [](const vk::QueueFamilyProperties& Prop) {
+        return Prop.queueFlags & vk::QueueFlagBits::eCompute;
+    });
+    Ctx.ComputeQueueFamilyIndex = std::distance(QueueFamilyProps.begin(), PropIt);
+    std::cout << "Compute Queue Family Index: " << Ctx.ComputeQueueFamilyIndex << std::endl;
+}
 
+void CreateDevice(TContext& Ctx)
+{
+    ZoneScopedN("CreateDevice");
 
-////////////////////////////////////////////////////////////////////////
-//                               DEVICE                               //
-////////////////////////////////////////////////////////////////////////
-	float queuePriorities = 1.0f;
-	vk::DeviceQueueCreateInfo DeviceQueueCreateInfo(
-			vk::DeviceQueueCreateFlags(),   // Flags
-			ComputeQueueFamilyIndex,        // Queue Family Index
-			1,                              // Number of Queues
-			&queuePriorities
-			);
-	vk::DeviceCreateInfo DeviceCreateInfo(
-			vk::DeviceCreateFlags(),   // Flags
-			1,
-			&DeviceQueueCreateInfo      // Device Queue Create Info struct
-			);
-	vk::Device Device = PhysicalDevice.createDevice(DeviceCreateInfo);
+    float queuePriorities = 1.0f;
+    vk::DeviceQueueCreateInfo DeviceQueueCreateInfo(
+            vk::DeviceQueueCreateFlags(),   // Flags
+            Ctx.ComputeQueueFamilyIndex,    // Queue Family Index
+            1,                              // Number of Queues
+            &queuePriorities
+            );
+    vk::DeviceCreateInfo DeviceCreateInfo(
+            vk::DeviceCreateFlags(),        // Flags
+            1,
+            &DeviceQueueCreateInfo          // Device Queue Create Info struct
+            );
+    Ctx.Device = Ctx.PhysicalDevice.createDevice(DeviceCreateInfo);
+    Ctx.Queue = Ctx.Device.getQueue(Ctx.ComputeQueueFamilyIndex, 0);
 
-    // Save references for Tracy Vk context and create a dedicated command buffer
-    // for Tracy's internal GPU timestamp queries
-    TracyDevice = Device;
-    TracyQueue  = Device.getQueue(ComputeQueueFamilyIndex, 0);
+    g_DestroyStack.push([&Ctx]() {
+        Ctx.Device.destroy();
+    });
+}
 
+void CreateTracyVulkanContext(TContext& Ctx)
+{
+    ZoneScopedN("CreateTracyVulkanContext");
+
+    // Create a dedicated command pool and buffer for Tracy's internal use.
+    // Tracy's background thread will use this for periodic timestamp collection.
+    vk::CommandPoolCreateInfo TracyCmdPoolInfo(
+        vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+        Ctx.ComputeQueueFamilyIndex);
+    Ctx.TracyCommandPool = Ctx.Device.createCommandPool(TracyCmdPoolInfo);
+
+    vk::CommandBufferAllocateInfo TracyCmdBufInfo(
+        Ctx.TracyCommandPool, vk::CommandBufferLevel::ePrimary, 1);
+    std::vector<vk::CommandBuffer> TracyCmdBufs =
+        Ctx.Device.allocateCommandBuffers(TracyCmdBufInfo);
+    Ctx.TracyCmdBuffer = TracyCmdBufs.front();
+
+    // Begin recording on Tracy command buffer for context creation
+    vk::CommandBufferBeginInfo TracyBeginInfo{};
+    Ctx.TracyCmdBuffer.begin(TracyBeginInfo);
+
+    // Create Tracy Vulkan context with the command buffer in recording state
+    Ctx.ProfilerCtx = ProfilerVkContext(
+        static_cast<VkPhysicalDevice>(Ctx.PhysicalDevice),
+        static_cast<VkDevice>(Ctx.Device),
+        static_cast<VkQueue>(Ctx.Queue),
+        static_cast<VkCommandBuffer>(Ctx.TracyCmdBuffer));
+
+    ProfilerVkContextName(Ctx.ProfilerCtx, "Compute", 7);
+
+    // End recording and submit the Tracy command buffer
+    Ctx.TracyCmdBuffer.end();
+    vk::SubmitInfo TracySubmitInfo(0, nullptr, nullptr, 1, &Ctx.TracyCmdBuffer);
+    vk::Fence TracyFence = Ctx.Device.createFence(vk::FenceCreateInfo());
+    Ctx.Queue.submit({ TracySubmitInfo }, TracyFence);
+    (void) Ctx.Device.waitForFences({ TracyFence }, true, uint64_t(-1));
+    Ctx.Device.destroyFence(TracyFence);
+
+    // Wait for queue to be idle
+    Ctx.Queue.waitIdle();
+
+    g_DestroyStack.push([&Ctx]() {
+        // Wait for GPU to be idle before destroying Tracy resources
+        Ctx.Device.waitIdle();
+        
+        if (Ctx.ProfilerCtx) {
+            ProfilerVkDestroy(Ctx.ProfilerCtx);
+            Ctx.ProfilerCtx = nullptr;
+        }
+        Ctx.Device.destroyCommandPool(Ctx.TracyCommandPool);
+    });
+}
+
+void CreateBuffers(TContext& Ctx)
+{
+    ZoneScopedN("CreateBuffers");
+
+    const uint32_t NumElements = Ctx.NumElements;
+    const uint32_t Count = NumElements;
+    Ctx.BufferSize = NumElements * sizeof(int32_t);
+
+    // Create buffers
+    vk::BufferCreateInfo BufferCreateInfo{
+        vk::BufferCreateFlags(),                    // Flags
+        Ctx.BufferSize,                             // Size
+        vk::BufferUsageFlagBits::eStorageBuffer,    // Usage
+        vk::SharingMode::eExclusive,                // Sharing mode
+        1,                                          // Number of queue family indices
+        &Ctx.ComputeQueueFamilyIndex                // List of queue family indices
+    };
+    Ctx.InBuffer = Ctx.Device.createBuffer(BufferCreateInfo);
+    Ctx.OutBuffer = Ctx.Device.createBuffer(BufferCreateInfo);
+
+    vk::BufferCreateInfo ParamsBufferCreateInfo{
+        vk::BufferCreateFlags(),                    // Flags
+        sizeof(uint32_t),                           // Size
+        vk::BufferUsageFlagBits::eUniformBuffer,    // Usage
+        vk::SharingMode::eExclusive,                // Sharing mode
+        1,                                          // Number of queue family indices
+        &Ctx.ComputeQueueFamilyIndex                // List of queue family indices
+    };
+    Ctx.ParamsBuffer = Ctx.Device.createBuffer(ParamsBufferCreateInfo);
+
+    // Memory requirements
+    vk::MemoryRequirements InBufferMemoryRequirements = Ctx.Device.getBufferMemoryRequirements(Ctx.InBuffer);
+    vk::MemoryRequirements OutBufferMemoryRequirements = Ctx.Device.getBufferMemoryRequirements(Ctx.OutBuffer);
+    vk::MemoryRequirements ParamsBufferMemoryRequirements = Ctx.Device.getBufferMemoryRequirements(Ctx.ParamsBuffer);
+
+    // Query memory properties
+    vk::PhysicalDeviceMemoryProperties MemoryProperties = Ctx.PhysicalDevice.getMemoryProperties();
+
+    uint32_t MemoryTypeIndex = uint32_t(~0);
+    vk::DeviceSize MemoryHeapSize = uint32_t(~0);
+    for (uint32_t CurrentMemoryTypeIndex = 0; CurrentMemoryTypeIndex < MemoryProperties.memoryTypeCount; ++CurrentMemoryTypeIndex)
     {
-        vk::CommandPoolCreateInfo TracyCmdPoolInfo(
-            vk::CommandPoolCreateFlagBits::eTransient |
-            vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-            ComputeQueueFamilyIndex);
-        TracyCommandPool = Device.createCommandPool(TracyCmdPoolInfo);
-
-        vk::CommandBufferAllocateInfo TracyCmdBufInfo(
-            TracyCommandPool, vk::CommandBufferLevel::ePrimary, 1);
-        std::vector<vk::CommandBuffer> TracyCmdBufs =
-            Device.allocateCommandBuffers(TracyCmdBufInfo);
-        TracyCmdBuffer = TracyCmdBufs.front();
+        vk::MemoryType MemoryType = MemoryProperties.memoryTypes[CurrentMemoryTypeIndex];
+        if ((vk::MemoryPropertyFlagBits::eHostVisible & MemoryType.propertyFlags) &&
+            (vk::MemoryPropertyFlagBits::eHostCoherent & MemoryType.propertyFlags))
+        {
+            MemoryHeapSize = MemoryProperties.memoryHeaps[MemoryType.heapIndex].size;
+            MemoryTypeIndex = CurrentMemoryTypeIndex;
+            break;
+        }
     }
 
-    // Create Tracy Vulkan context (raw handles required by TracyVkContext)
-    ProfilerCtx = ProfilerVkContext(
-        static_cast<VkPhysicalDevice>(PhysicalDevice),
-        static_cast<VkDevice>(Device),
-        static_cast<VkQueue>(TracyQueue),
-        static_cast<VkCommandBuffer>(TracyCmdBuffer));
+    std::cout << "Memory Type Index: " << MemoryTypeIndex << std::endl;
+    std::cout << "Memory Heap Size : " << MemoryHeapSize / 1024 / 1024 / 1024 << " GB" << std::endl;
 
-    ProfilerVkContextName(ProfilerCtx, "Compute", 7);
+    // Allocate memory
+    vk::MemoryAllocateInfo InBufferMemoryAllocateInfo(InBufferMemoryRequirements.size, MemoryTypeIndex);
+    vk::MemoryAllocateInfo OutBufferMemoryAllocateInfo(OutBufferMemoryRequirements.size, MemoryTypeIndex);
+    vk::MemoryAllocateInfo ParamsBufferMemoryAllocateInfo(ParamsBufferMemoryRequirements.size, MemoryTypeIndex);
+    Ctx.InBufferMemory = Ctx.Device.allocateMemory(InBufferMemoryAllocateInfo);
+    Ctx.OutBufferMemory = Ctx.Device.allocateMemory(OutBufferMemoryAllocateInfo);
+    Ctx.ParamsBufferMemory = Ctx.Device.allocateMemory(ParamsBufferMemoryAllocateInfo);
 
-////////////////////////////////////////////////////////////////////////
-//                         Allocating Memory                          //
-////////////////////////////////////////////////////////////////////////
-	// Create the required buffers for the application
-    // Allocate the memory to back the buffers
-    // Bind the buffers to the memory
-	
-	// Create buffers
-	const uint32_t NumElements = 10;
-	const uint32_t Count = NumElements;
-	const uint32_t BufferSize = NumElements * sizeof(int32_t);
+    // Map memory and write
+    int32_t* InBufferPtr = static_cast<int32_t*>(Ctx.Device.mapMemory(Ctx.InBufferMemory, 0, Ctx.BufferSize));
+    for (uint32_t I = 0; I < NumElements; ++I) {
+        InBufferPtr[I] = NumElements - I;
+    }
+    Ctx.Device.unmapMemory(Ctx.InBufferMemory);
 
-	vk::BufferCreateInfo BufferCreateInfo{
-		vk::BufferCreateFlags(),                    // Flags
-		BufferSize,                                 // Size
-		vk::BufferUsageFlagBits::eStorageBuffer,    // Usage
-		vk::SharingMode::eExclusive,                // Sharing mode
-		1,                                          // Number of queue family indices
-		&ComputeQueueFamilyIndex                    // List of queue family indices
-	};
-	vk::Buffer InBuffer = Device.createBuffer(BufferCreateInfo);
-	vk::Buffer OutBuffer = Device.createBuffer(BufferCreateInfo);
+    uint32_t* ParamsBufferPtr = static_cast<uint32_t*>(Ctx.Device.mapMemory(Ctx.ParamsBufferMemory, 0, sizeof(uint32_t)));
+    *ParamsBufferPtr = Count;
+    Ctx.Device.unmapMemory(Ctx.ParamsBufferMemory);
 
-	vk::BufferCreateInfo ParamsBufferCreateInfo{
-		vk::BufferCreateFlags(),                    // Flags
-		sizeof(uint32_t),                           // Size
-		vk::BufferUsageFlagBits::eUniformBuffer,    // Usage
-		vk::SharingMode::eExclusive,                // Sharing mode
-		1,                                          // Number of queue family indices
-		&ComputeQueueFamilyIndex                    // List of queue family indices
-	};
-	vk::Buffer ParamsBuffer = Device.createBuffer(ParamsBufferCreateInfo);
+    // Bind buffers to memory
+    Ctx.Device.bindBufferMemory(Ctx.InBuffer, Ctx.InBufferMemory, 0);
+    Ctx.Device.bindBufferMemory(Ctx.OutBuffer, Ctx.OutBufferMemory, 0);
+    Ctx.Device.bindBufferMemory(Ctx.ParamsBuffer, Ctx.ParamsBufferMemory, 0);
 
-	// Memory req
-	vk::MemoryRequirements InBufferMemoryRequirements = Device.getBufferMemoryRequirements(InBuffer);
-	vk::MemoryRequirements OutBufferMemoryRequirements = Device.getBufferMemoryRequirements(OutBuffer);
-	vk::MemoryRequirements ParamsBufferMemoryRequirements = Device.getBufferMemoryRequirements(ParamsBuffer);
+    g_DestroyStack.push([&Ctx]() {
+        Ctx.Device.freeMemory(Ctx.InBufferMemory);
+        Ctx.Device.freeMemory(Ctx.OutBufferMemory);
+        Ctx.Device.freeMemory(Ctx.ParamsBufferMemory);
+        Ctx.Device.destroyBuffer(Ctx.InBuffer);
+        Ctx.Device.destroyBuffer(Ctx.OutBuffer);
+        Ctx.Device.destroyBuffer(Ctx.ParamsBuffer);
+    });
+}
 
-	// query
-	vk::PhysicalDeviceMemoryProperties MemoryProperties = PhysicalDevice.getMemoryProperties();
+void CreatePipeline(TContext& Ctx)
+{
+    ZoneScopedN("CreatePipeline");
 
-	uint32_t MemoryTypeIndex = uint32_t(~0);
-	vk::DeviceSize MemoryHeapSize = uint32_t(~0);
-	for (uint32_t CurrentMemoryTypeIndex = 0; CurrentMemoryTypeIndex < MemoryProperties.memoryTypeCount; ++CurrentMemoryTypeIndex)
-	{
-		vk::MemoryType MemoryType = MemoryProperties.memoryTypes[CurrentMemoryTypeIndex];
-		if ((vk::MemoryPropertyFlagBits::eHostVisible & MemoryType.propertyFlags) &&
-			(vk::MemoryPropertyFlagBits::eHostCoherent & MemoryType.propertyFlags))
-		{
-			MemoryHeapSize = MemoryProperties.memoryHeaps[MemoryType.heapIndex].size;
-			MemoryTypeIndex = CurrentMemoryTypeIndex;
-			break;
-		}
-	}
+    // Shader module
+    std::vector<char> ShaderContents;
+    if (std::ifstream ShaderFile{ "shaders/shader.hlsl.spv", std::ios::binary | std::ios::ate }) {
+        const size_t FileSize = ShaderFile.tellg();
+        ShaderFile.seekg(0);
+        ShaderContents.resize(FileSize, '\0');
+        ShaderFile.read(ShaderContents.data(), FileSize);
+    }
 
-	std::cout << "Memory Type Index: " << MemoryTypeIndex << std::endl;
-	std::cout << "Memory Heap Size : " << MemoryHeapSize / 1024 / 1024 / 1024 << " GB" << std::endl;
+    vk::ShaderModuleCreateInfo ShaderModuleCreateInfo(
+        vk::ShaderModuleCreateFlags(),                                // Flags
+        ShaderContents.size(),                                        // Code size
+        reinterpret_cast<const uint32_t*>(ShaderContents.data()));    // Code
+    Ctx.ShaderModule = Ctx.Device.createShaderModule(ShaderModuleCreateInfo);
 
-	// Allocate memory
-	vk::MemoryAllocateInfo InBufferMemoryAllocateInfo(InBufferMemoryRequirements.size, MemoryTypeIndex);
-	vk::MemoryAllocateInfo OutBufferMemoryAllocateInfo(OutBufferMemoryRequirements.size, MemoryTypeIndex);
-	vk::MemoryAllocateInfo ParamsBufferMemoryAllocateInfo(ParamsBufferMemoryRequirements.size, MemoryTypeIndex);
-	vk::DeviceMemory InBufferMemory = Device.allocateMemory(InBufferMemoryAllocateInfo);
-	vk::DeviceMemory OutBufferMemory = Device.allocateMemory(OutBufferMemoryAllocateInfo);
-	vk::DeviceMemory ParamsBufferMemory = Device.allocateMemory(ParamsBufferMemoryAllocateInfo);
+    // Descriptor Set Layout
+    const std::vector<vk::DescriptorSetLayoutBinding> DescriptorSetLayoutBinding = {
+        {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+        {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+        {2, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eCompute}
+    };
+    vk::DescriptorSetLayoutCreateInfo DescriptorSetLayoutCreateInfo(
+        vk::DescriptorSetLayoutCreateFlags(),
+        DescriptorSetLayoutBinding);
+    Ctx.DescriptorSetLayout = Ctx.Device.createDescriptorSetLayout(DescriptorSetLayoutCreateInfo);
 
-	// Map memory and write
-	int32_t* InBufferPtr = static_cast<int32_t*>(Device.mapMemory(InBufferMemory, 0, BufferSize));
-	for (uint32_t I = 0; I < NumElements; ++I) {
-		InBufferPtr[I] = NumElements - I;
-	}
-	Device.unmapMemory(InBufferMemory);
+    // Pipeline Layout
+    vk::PipelineLayoutCreateInfo PipelineLayoutCreateInfo(vk::PipelineLayoutCreateFlags(), Ctx.DescriptorSetLayout);
+    Ctx.PipelineLayout = Ctx.Device.createPipelineLayout(PipelineLayoutCreateInfo);
+    Ctx.PipelineCache = Ctx.Device.createPipelineCache(vk::PipelineCacheCreateInfo());
 
-	uint32_t* ParamsBufferPtr = static_cast<uint32_t*>(Device.mapMemory(ParamsBufferMemory, 0, sizeof(uint32_t)));
-	*ParamsBufferPtr = Count;
-	Device.unmapMemory(ParamsBufferMemory);
+    // Compute Pipeline
+    vk::PipelineShaderStageCreateInfo PipelineShaderCreateInfo(
+        vk::PipelineShaderStageCreateFlags(),  // Flags
+        vk::ShaderStageFlagBits::eCompute,     // Stage
+        Ctx.ShaderModule,                      // Shader Module
+        "main"                                 // Shader Entry Point
+        );
+    vk::ComputePipelineCreateInfo ComputePipelineCreateInfo(
+        vk::PipelineCreateFlags(),    // Flags
+        PipelineShaderCreateInfo,     // Shader Create Info struct
+        Ctx.PipelineLayout            // Pipeline Layout
+        );
+    Ctx.ComputePipeline = Ctx.Device.createComputePipeline(Ctx.PipelineCache, ComputePipelineCreateInfo).value;
 
-	// Bind buffers to memory
-	Device.bindBufferMemory(InBuffer, InBufferMemory, 0);
-	Device.bindBufferMemory(OutBuffer, OutBufferMemory, 0);
-	Device.bindBufferMemory(ParamsBuffer, ParamsBufferMemory, 0);
+    g_DestroyStack.push([&Ctx]() {
+        Ctx.Device.destroyPipeline(Ctx.ComputePipeline);
+        Ctx.Device.destroyPipelineCache(Ctx.PipelineCache);
+        Ctx.Device.destroyPipelineLayout(Ctx.PipelineLayout);
+        Ctx.Device.destroyDescriptorSetLayout(Ctx.DescriptorSetLayout);
+        Ctx.Device.destroyShaderModule(Ctx.ShaderModule);
+    });
+}
 
-////////////////////////////////////////////////////////////////////////
-//                              PIPELINE                              //
-////////////////////////////////////////////////////////////////////////
+void CreateDescriptorSets(TContext& Ctx)
+{
+    ZoneScopedN("CreateDescriptorSets");
 
-	// Shader module
-	std::vector<char> ShaderContents;
-	if (std::ifstream ShaderFile{ "shaders/shader.hlsl.spv", std::ios::binary | std::ios::ate }) {
-		const size_t FileSize = ShaderFile.tellg();
-		ShaderFile.seekg(0);
-		ShaderContents.resize(FileSize, '\0');
-		ShaderFile.read(ShaderContents.data(), FileSize);
-	}
+    const std::vector<vk::DescriptorPoolSize> DescriptorPoolSizes = {
+        vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 2),
+        vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 1)
+    };
+    vk::DescriptorPoolCreateInfo DescriptorPoolCreateInfo(vk::DescriptorPoolCreateFlags(), 1, DescriptorPoolSizes);
+    Ctx.DescriptorPool = Ctx.Device.createDescriptorPool(DescriptorPoolCreateInfo);
 
-	vk::ShaderModuleCreateInfo ShaderModuleCreateInfo(
-		vk::ShaderModuleCreateFlags(),                                // Flags
-		ShaderContents.size(),                                        // Code size
-		reinterpret_cast<const uint32_t*>(ShaderContents.data()));    // Code
-    vk::ShaderModule ShaderModule = Device.createShaderModule(ShaderModuleCreateInfo);
+    // Allocate descriptor sets, update them to use buffers:
+    vk::DescriptorSetAllocateInfo DescriptorSetAllocInfo(Ctx.DescriptorPool, 1, &Ctx.DescriptorSetLayout);
+    const std::vector<vk::DescriptorSet> DescriptorSets = Ctx.Device.allocateDescriptorSets(DescriptorSetAllocInfo);
+    Ctx.DescriptorSet = DescriptorSets.front();
+    vk::DescriptorBufferInfo InBufferInfo(Ctx.InBuffer, 0, Ctx.NumElements * sizeof(int32_t));
+    vk::DescriptorBufferInfo OutBufferInfo(Ctx.OutBuffer, 0, Ctx.NumElements * sizeof(int32_t));
+    vk::DescriptorBufferInfo ParamsBufferInfo(Ctx.ParamsBuffer, 0, sizeof(uint32_t));
 
-	// Descriptor Set Layout
-	// The layout of data to be passed to pipeline
-	const std::vector<vk::DescriptorSetLayoutBinding> DescriptorSetLayoutBinding = {
-		{0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
-		{1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
-		{2, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eCompute}
-	};
-	vk::DescriptorSetLayoutCreateInfo DescriptorSetLayoutCreateInfo(
-		vk::DescriptorSetLayoutCreateFlags(),
-		DescriptorSetLayoutBinding);
-	vk::DescriptorSetLayout DescriptorSetLayout = Device.createDescriptorSetLayout(DescriptorSetLayoutCreateInfo);
+    const std::vector<vk::WriteDescriptorSet> WriteDescriptorSets = {
+        {Ctx.DescriptorSet, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &InBufferInfo},
+        {Ctx.DescriptorSet, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &OutBufferInfo},
+        {Ctx.DescriptorSet, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &ParamsBufferInfo}
+    };
+    Ctx.Device.updateDescriptorSets(WriteDescriptorSets, {});
 
-	// Pipeline Layout
-	vk::PipelineLayoutCreateInfo PipelineLayoutCreateInfo(vk::PipelineLayoutCreateFlags(), DescriptorSetLayout);
-	vk::PipelineLayout PipelineLayout = Device.createPipelineLayout(PipelineLayoutCreateInfo);
-	vk::PipelineCache PipelineCache = Device.createPipelineCache(vk::PipelineCacheCreateInfo());
+    g_DestroyStack.push([&Ctx]() {
+        Ctx.Device.destroyDescriptorPool(Ctx.DescriptorPool);
+    });
+}
 
-	// Compute Pipeline
-	vk::PipelineShaderStageCreateInfo PipelineShaderCreateInfo(
-		vk::PipelineShaderStageCreateFlags(),  // Flags
-		vk::ShaderStageFlagBits::eCompute,     // Stage
-		ShaderModule,                          // Shader Module
-		"main"                                 // Shader Entry Point
-		);
-	vk::ComputePipelineCreateInfo ComputePipelineCreateInfo(
-		vk::PipelineCreateFlags(),    // Flags
-		PipelineShaderCreateInfo,     // Shader Create Info struct
-		PipelineLayout                // Pipeline Layout
-		);
-	vk::Pipeline ComputePipeline = Device.createComputePipeline(PipelineCache, ComputePipelineCreateInfo).value;
+void SubmitWork(TContext& Ctx)
+{
+    ZoneScopedN("SubmitWork");
 
-////////////////////////////////////////////////////////////////////////
-//                          DESCRIPTOR SETS                           //
-////////////////////////////////////////////////////////////////////////
-	// Descriptor sets must be allocated in a vk::DescriptorPool, so we need to create one first
-	const std::vector<vk::DescriptorPoolSize> DescriptorPoolSizes = {
-		vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 2),
-		vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 1)
-	};
-	vk::DescriptorPoolCreateInfo DescriptorPoolCreateInfo(vk::DescriptorPoolCreateFlags(), 1, DescriptorPoolSizes);
-	vk::DescriptorPool DescriptorPool = Device.createDescriptorPool(DescriptorPoolCreateInfo);
+    // Command Pool
+    vk::CommandPoolCreateInfo CommandPoolCreateInfo(vk::CommandPoolCreateFlags(), Ctx.ComputeQueueFamilyIndex);
+    Ctx.CommandPool = Ctx.Device.createCommandPool(CommandPoolCreateInfo);
 
-	// Allocate descriptor sets, update them to use buffers:
-	vk::DescriptorSetAllocateInfo DescriptorSetAllocInfo(DescriptorPool, 1, &DescriptorSetLayout);
-	const std::vector<vk::DescriptorSet> DescriptorSets = Device.allocateDescriptorSets(DescriptorSetAllocInfo);
-	vk::DescriptorSet DescriptorSet = DescriptorSets.front();
-	vk::DescriptorBufferInfo InBufferInfo(InBuffer, 0, NumElements * sizeof(int32_t));
-	vk::DescriptorBufferInfo OutBufferInfo(OutBuffer, 0, NumElements * sizeof(int32_t));
-	vk::DescriptorBufferInfo ParamsBufferInfo(ParamsBuffer, 0, sizeof(uint32_t));
+    // Allocate Command buffer from Pool
+    vk::CommandBufferAllocateInfo CommandBufferAllocInfo(
+        Ctx.CommandPool,                         // Command Pool
+        vk::CommandBufferLevel::ePrimary,        // Level
+        1);                                      // Num Command Buffers
+    const std::vector<vk::CommandBuffer> CmdBuffers = Ctx.Device.allocateCommandBuffers(CommandBufferAllocInfo);
+    Ctx.CmdBuffer = CmdBuffers.front();
 
-	const std::vector<vk::WriteDescriptorSet> WriteDescriptorSets = {
-		{DescriptorSet, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &InBufferInfo},
-		{DescriptorSet, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &OutBufferInfo},
-		{DescriptorSet, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &ParamsBufferInfo}
-	};
-	Device.updateDescriptorSets(WriteDescriptorSets, {});
+    // Record commands
+    vk::CommandBufferBeginInfo CmdBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+    Ctx.CmdBuffer.begin(CmdBufferBeginInfo);
 
-////////////////////////////////////////////////////////////////////////
-//                         SUBMIT WORK TO GPU                         //
-////////////////////////////////////////////////////////////////////////
-    ////////////////////////////////////////////////////////////////////////
-	// Command Pool
-	vk::CommandPoolCreateInfo CommandPoolCreateInfo(vk::CommandPoolCreateFlags(), ComputeQueueFamilyIndex);
-	vk::CommandPool CommandPool = Device.createCommandPool(CommandPoolCreateInfo);
-	// Allocate Command buffer from Pool
-	vk::CommandBufferAllocateInfo CommandBufferAllocInfo(
-    CommandPool,                         // Command Pool
-    vk::CommandBufferLevel::ePrimary,    // Level
-    1);                                  // Num Command Buffers
-	const std::vector<vk::CommandBuffer> CmdBuffers = Device.allocateCommandBuffers(CommandBufferAllocInfo);
-	vk::CommandBuffer CmdBuffer = CmdBuffers.front();
+    // GPU zone scope - must end before CmdBuffer.end() is called
+    {
+        ProfilerVkZone(Ctx.ProfilerCtx, static_cast<VkCommandBuffer>(Ctx.CmdBuffer), "ComputeDispatch");
 
-	// Record commands
-	vk::CommandBufferBeginInfo CmdBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
-	CmdBuffer.begin(CmdBufferBeginInfo);
+        Ctx.CmdBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, Ctx.ComputePipeline);
+        Ctx.CmdBuffer.bindDescriptorSets(
+                vk::PipelineBindPoint::eCompute,    // Bind point
+                Ctx.PipelineLayout,                 // Pipeline Layout
+                0,                                  // First descriptor set
+                { Ctx.DescriptorSet },              // List of descriptor sets
+                {});                                // Dynamic offsets
+        Ctx.CmdBuffer.dispatch(Ctx.NumElements, 1, 1);
+        // VkCtxScope destructor called here, while CmdBuffer is still recording
+    }
 
-    // GPU zone: capture the compute dispatch on the GPU timeline
-    ProfilerVkZone(ProfilerCtx, static_cast<VkCommandBuffer>(CmdBuffer), "ComputeDispatch");
+    Ctx.CmdBuffer.end();
 
-	CmdBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, ComputePipeline);
-	CmdBuffer.bindDescriptorSets(
-			vk::PipelineBindPoint::eCompute,    // Bind point
-			PipelineLayout,                  // Pipeline Layout
-			0,                               // First descriptor set
-			{ DescriptorSet },               // List of descriptor sets
-			{});                             // Dynamic offsets
-	CmdBuffer.dispatch(NumElements, 1, 1);
-	CmdBuffer.end();
+    // Fence and submit
+    Ctx.Fence = Ctx.Device.createFence(vk::FenceCreateInfo());
+    vk::SubmitInfo SubmitInfo(
+            0,                // Num Wait Semaphores
+            nullptr,          // Wait Semaphores
+            nullptr,          // Pipeline Stage Flags
+            1,                // Num Command Buffers
+            &Ctx.CmdBuffer);  // List of command buffers
+    Ctx.Queue.submit({ SubmitInfo }, Ctx.Fence);
+    (void) Ctx.Device.waitForFences(
+            { Ctx.Fence },    // List of fences
+            true,             // Wait All
+            uint64_t(-1));    // Timeout
 
-    // Collect GPU timestamps from Tracy after recording
-    ProfilerVkCollect(ProfilerCtx, static_cast<VkCommandBuffer>(CmdBuffer));
-    ProfilerVkCollect(ProfilerCtx, static_cast<VkCommandBuffer>(TracyCmdBuffer));
+    // Map output buffer and read results
+    int32_t* InBufferPtr = static_cast<int32_t*>(Ctx.Device.mapMemory(Ctx.InBufferMemory, 0, Ctx.BufferSize));
+    std::cout << std::endl;
+    std::cout << "INPUT:  ";
+    for (uint32_t I = 0; I < Ctx.NumElements; ++I) {
+        std::cout << InBufferPtr[I] << " ";
+    }
+    std::cout << std::endl;
+    Ctx.Device.unmapMemory(Ctx.InBufferMemory);
 
-	// Fence and submit
-	vk::Queue Queue = Device.getQueue(ComputeQueueFamilyIndex, 0);
-	vk::Fence Fence = Device.createFence(vk::FenceCreateInfo());
-	vk::SubmitInfo SubmitInfo(
-			0,                // Num Wait Semaphores
-			nullptr,        // Wait Semaphores
-			nullptr,        // Pipeline Stage Flags
-			1,              // Num Command Buffers
-			&CmdBuffer);    // List of command buffers
-	Queue.submit({ SubmitInfo }, Fence);
-	(void) Device.waitForFences(
-			{ Fence },             // List of fences
-			true,               // Wait All
-			uint64_t(-1));      // Timeout
+    int32_t* OutBufferPtr = static_cast<int32_t*>(Ctx.Device.mapMemory(Ctx.OutBufferMemory, 0, Ctx.BufferSize));
+    std::cout << "OUTPUT: ";
+    for (uint32_t I = 0; I < Ctx.NumElements; ++I) {
+        std::cout << OutBufferPtr[I] << " ";
+    }
+    std::cout << std::endl;
+    Ctx.Device.unmapMemory(Ctx.OutBufferMemory);
 
-	// Map output buffer and read results
-	InBufferPtr = static_cast<int32_t*>(Device.mapMemory(InBufferMemory, 0, BufferSize));
-	std::cout << std::endl;
-	std::cout << "INPUT:  ";
-	for (uint32_t I = 0; I < NumElements; ++I) {
-		std::cout << InBufferPtr[I] << " ";
-	}
-	std::cout << std::endl;
-	Device.unmapMemory(InBufferMemory);
+    g_DestroyStack.push([&Ctx]() {
+        Ctx.Device.destroyFence(Ctx.Fence);
+        Ctx.Device.resetCommandPool(Ctx.CommandPool, vk::CommandPoolResetFlags());
+        Ctx.Device.destroyCommandPool(Ctx.CommandPool);
+    });
+}
 
-	int32_t* OutBufferPtr = static_cast<int32_t*>(Device.mapMemory(OutBufferMemory, 0, BufferSize));
-	std::cout << "OUTPUT: ";
-	for (uint32_t I = 0; I < NumElements; ++I) {
-		std::cout << OutBufferPtr[I] << " ";
-	}
-	std::cout << std::endl;
-	Device.unmapMemory(OutBufferMemory);
+void Cleanup(TContext& Ctx)
+{
+    ZoneScopedN("Cleanup");
+
+    // Execute destroy lambdas in reverse order (LIFO)
+    while (!g_DestroyStack.empty()) {
+        g_DestroyStack.top()();
+        g_DestroyStack.pop();
+    }
+}
+
+
+//////////////////////////////////////////////////////////////////////////
+//                              MAIN                                    //
+//////////////////////////////////////////////////////////////////////////
+
+int main(int argc, char *argv[]) {
+
+    // ── Profiler startup (manual lifetime required by TRACY_MANUAL_LIFETIME) ──
+    ProfilerStartup();
+    SetTracyActive(true);
+    ProfilerAppInfo("MinimalVulkanCompute", 21);
+    ZoneScoped;                         // CPU zone for the whole main()
+
+    TContext Ctx;
+
+    CreateInstance(Ctx);
+    SelectPhysicalDevice(Ctx);
+    FindQueueFamily(Ctx);
+    CreateDevice(Ctx);
+    CreateTracyVulkanContext(Ctx);
+    CreateBuffers(Ctx);
+    CreatePipeline(Ctx);
+    CreateDescriptorSets(Ctx);
+    SubmitWork(Ctx);
 
     FrameMark;
 
-////////////////////////////////////////////////////////////////////////
-//                              CLEANUP                               //
-////////////////////////////////////////////////////////////////////////
-	Device.resetCommandPool(CommandPool, vk::CommandPoolResetFlags());
-	Device.destroyFence(Fence);
-	Device.destroyDescriptorSetLayout(DescriptorSetLayout);
-	Device.destroyPipelineLayout(PipelineLayout);
-	Device.destroyPipelineCache(PipelineCache);
-	Device.destroyShaderModule(ShaderModule);
-	Device.destroyPipeline(ComputePipeline);
-	Device.destroyDescriptorPool(DescriptorPool);
-	Device.destroyCommandPool(CommandPool);
-	Device.freeMemory(InBufferMemory);
-	Device.freeMemory(OutBufferMemory);
-	Device.freeMemory(ParamsBufferMemory);
-	Device.destroyBuffer(InBuffer);
-	Device.destroyBuffer(OutBuffer);
-	Device.destroyBuffer(ParamsBuffer);
-
-    // Teardown order is critical:
-    //   1. Destroy Tracy Vk context (stops GPU queries)
-    //   2. Destroy the Tracy-dedicated command pool
-    //   3. Destroy device + instance
-    //   4. Shutdown the Tracy profiler (stops the worker thread, finalizes rpmalloc)
-    //   5. _exit() instead of return to skip C++ static destructors that would
-    //      otherwise hit Tracy's finalised rpmalloc state.
-    if (ProfilerCtx) {
-        ProfilerVkDestroy(ProfilerCtx);
-    }
-    Device.destroyCommandPool(TracyCommandPool);
-
-	Device.destroy();
-	Instance.destroy();
+    Cleanup(Ctx);
 
     ProfilerShutdown();
     _exit(0);
