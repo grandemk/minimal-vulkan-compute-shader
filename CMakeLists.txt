@@ -64,6 +64,7 @@ foreach(source IN LISTS HLSL_SHADERS)
       -spirv                        # Output SPIR-V instead of DXIL
       -T ${SHADER_PROFILE}          # Shader profile (cs_6_0 for compute)
       -E main                       # Entry point name
+      -fspv-target-env=vulkan1.1
       ${source}
       -Fo ${SHADER_BINARY_DIR}/${FILENAME}.hlsl.spv
     OUTPUT ${SHADER_BINARY_DIR}/${FILENAME}.hlsl.spv
